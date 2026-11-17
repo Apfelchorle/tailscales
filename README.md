@@ -24,6 +24,7 @@ Screenshots
 | ![Devices](docs/screenshot-devices.png) | ![Ping](docs/screenshot-ping.png) | ![Exit nodes](docs/screenshot-exit-nodes.png) |
 
 *(Other users' names are blurred for privacy.)*
+*(Screenshot stolen from tunggyun)*
 
 Features
 --------
