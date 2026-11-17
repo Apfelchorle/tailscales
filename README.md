@@ -1,3 +1,5 @@
+# important note this is a vibecoded poc, i will make remake this soon
+
 Trayscale for Windows
 =====================
 
