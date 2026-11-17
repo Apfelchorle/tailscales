@@ -1,0 +1,99 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<!-- Created with Cambalache 0.96.1 -->
+<interface>
+  <!-- interface-name mainwindow.ui -->
+  <requires lib="gtk" version="4.18"/>
+  <requires lib="libadwaita" version="1.7"/>
+  <object class="AdwApplicationWindow" id="MainWindow">
+    <property name="content">ToastOverlay</property>
+    <property name="default-height">600</property>
+    <property name="default-width">800</property>
+    <property name="height-request">400</property>
+    <property name="title">Trayscale</property>
+    <property name="width-request">200</property>
+    <child>
+      <object class="AdwToastOverlay" id="ToastOverlay">
+        <child>
+          <object class="AdwNavigationSplitView" id="SplitView">
+            <property name="content">
+              <object class="AdwNavigationPage">
+                <property name="child">
+                  <object class="AdwToolbarView">
+                    <property name="content">
+                      <object class="AdwViewStack" id="PeersStack"/>
+                    </property>
+                    <child type="top">
+                      <object class="AdwHeaderBar" id="PageHeaderBar">
+                        <property name="show-start-title-buttons">False</property>
+                        <property name="show-title">False</property>
+                        <child type="end">
+                          <object class="GtkMenuButton" id="PageMenuButton">
+                            <property name="icon-name">open-menu-symbolic</property>
+                            <property name="menu-model">PageMenu</property>
+                          </object>
+                        </child>
+                        <child type="end">
+                          <object class="AdwSpinner" id="WorkSpinner">
+                            <property name="visible">False</property>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
+                  </object>
+                </property>
+                <property name="tag">content</property>
+                <property name="title"> </property>
+              </object>
+            </property>
+            <property name="max-sidebar-width">360.0</property>
+            <property name="min-sidebar-width">200.0</property>
+            <property name="sidebar">
+              <object class="AdwNavigationPage">
+                <property name="child">
+                  <object class="AdwToolbarView">
+                    <property name="content">
+                      <object class="GtkScrolledWindow">
+                        <property name="child">
+                          <object class="GtkListBox" id="PeersList">
+                            <property name="css-classes">navigation-sidebar</property>
+                          </object>
+                        </property>
+                      </object>
+                    </property>
+                    <child type="top">
+                      <object class="AdwHeaderBar">
+                        <property name="show-end-title-buttons">False</property>
+                        <child type="start">
+                          <object class="GtkSwitch" id="StatusSwitch"/>
+                        </child>
+                        <child type="end">
+                          <object class="GtkMenuButton" id="MainMenuButton">
+                            <property name="icon-name">open-menu-symbolic</property>
+                            <property name="menu-model">MainMenu</property>
+                            <property name="primary">True</property>
+                          </object>
+                        </child>
+                        <child type="title">
+                          <object class="GtkDropDown" id="ProfileDropDown"/>
+                        </child>
+                      </object>
+                    </child>
+                  </object>
+                </property>
+                <property name="tag">sidebar</property>
+                <property name="title">Trayscale</property>
+              </object>
+            </property>
+          </object>
+        </child>
+      </object>
+    </child>
+    <child>
+      <object class="AdwBreakpoint">
+        <!-- Custom object fragments -->
+        <condition>max-width: 400sp</condition>
+        <setter object="SplitView" property="collapsed">True</setter>
+      </object>
+    </child>
+  </object>
+</interface>

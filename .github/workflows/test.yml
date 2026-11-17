@@ -1,0 +1,79 @@
+name: Lint and Test
+
+env:
+  dependencies: libgtk-4-dev libadwaita-1-dev gobject-introspection
+  go-version: stable
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+  pull_request:
+
+jobs:
+  go-vet:
+    name: go vet
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ env.dependencies }}
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.go-version }}
+      - name: go vet
+        run: go vet -v ./...
+
+  staticcheck:
+    name: staticcheck
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ env.dependencies }}
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.go-version }}
+      - name: Staticcheck
+        uses: dominikh/staticcheck-action@v1
+        with:
+          install-go: false
+
+  go-test:
+    name: go test
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ env.dependencies }}
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.go-version }}
+      - name: go test
+        run: go test -v ./...
+
+  metainfo-validate:
+    name: metainfo validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y appstream
+      - name: appstreamcli validate
+        run: appstreamcli validate --pedantic --no-net --explain dev.deedles.Trayscale.metainfo.xml

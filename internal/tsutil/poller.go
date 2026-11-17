@@ -1,0 +1,719 @@
+package tsutil
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"maps"
+	"net/netip"
+	"os/user"
+	"sync"
+	"time"
+
+	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/feature/taildrop"
+	"tailscale.com/ipn"
+	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/tailcfg"
+	"tailscale.com/util/set"
+)
+
+// A Poller gets the latest Tailscale status at regular intervals or
+// when manually triggered.
+//
+// A zero-value of a Poller is ready to use.
+//
+// It is a race condition to change any exported fields of Poller
+// while Run is running.
+type Poller struct {
+	// Interval is the default interval to use for polling.
+	//
+	// If it is a zero, a non-zero default will be used.
+	Interval time.Duration
+
+	// If non-nil, New will be called when a new status is received from
+	// Tailscale.
+	New func(Status)
+
+	// If non-nil, Error will be called when starting or stopping
+	// Tailscale fails.
+	Error func(error)
+
+	// If non-nil, WatchError is called when the connection to the
+	// Tailscale LocalAPI changes state. It is called with a non-nil
+	// error when the IPN bus watcher cannot connect or stops, and with
+	// nil once a watcher connects successfully.
+	WatchError func(error)
+
+	once sync.Once
+
+	// setRunning is a test seam. Only tests set it, to fake starting
+	// and stopping Tailscale. It's nil in normal use, in which case the
+	// poller calls Start and Stop.
+	setRunning func(context.Context, bool) error
+
+	poll     chan struct{}
+	getIPN   chan *IPNStatus
+	nextIPN  chan *IPNStatus
+	interval chan time.Duration
+	running  chan bool
+	resend   chan struct{}
+}
+
+func (p *Poller) init() {
+	p.once.Do(func() {
+		p.poll = make(chan struct{})
+		p.getIPN = make(chan *IPNStatus)
+		p.nextIPN = make(chan *IPNStatus)
+		p.interval = make(chan time.Duration)
+		p.running = make(chan bool)
+		p.resend = make(chan struct{}, 1)
+	})
+}
+
+func (p *Poller) watchError(err error) {
+	if p.WatchError != nil {
+		p.WatchError(err)
+	}
+}
+
+// Run runs the poller. It blocks until polling is done, which is
+// generally a result of the given Context being cancelled.
+//
+// The behavior of two calls to Run running concurrently is undefined.
+// Don't do it.
+func (p *Poller) Run(ctx context.Context) {
+	p.init()
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	n := newNotifier()
+	go p.watchIPN(ctx)
+	go p.watchFiles(ctx, n)
+	go p.watchProfiles(ctx, n)
+
+	interval := p.Interval
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+
+	check := time.NewTicker(interval)
+	defer check.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case p.poll <- struct{}{}:
+			n = n.Notify()
+			check.Reset(interval)
+		case interval = <-p.interval:
+			n = n.Notify()
+			check.Reset(interval)
+		case up := <-p.running:
+			// Nothing is published while this runs, as publishing an IPN
+			// update waits for p.poll.
+			err := p.run(ctx, up)
+			if err != nil {
+				if p.Error != nil {
+					p.Error(err)
+				}
+				// Nothing changed, so the watcher won't send anything.
+				// Send the current status again so that the UI can undo
+				// whatever it did in anticipation.
+				select {
+				case p.resend <- struct{}{}:
+				default:
+				}
+			}
+			n = n.Notify()
+			check.Reset(interval)
+		case <-check.C:
+			n = n.Notify()
+		}
+	}
+}
+
+func (p *Poller) run(ctx context.Context, up bool) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	if p.setRunning != nil {
+		return p.setRunning(ctx, up)
+	}
+	if up {
+		return Start(ctx)
+	}
+	return Stop(ctx)
+}
+
+func (p *Poller) watchIPN(ctx context.Context) {
+	set := make(chan *IPNStatus)
+	go p.holdIPN(ctx, set)
+
+	// publish sends s on to holdIPN. Callers wait for p.poll first.
+	publish := func(s *IPNStatus) bool {
+		select {
+		case <-ctx.Done():
+			return false
+		case set <- s:
+		}
+		select {
+		case p.nextIPN <- s:
+		default:
+		}
+		return true
+	}
+
+	down := false
+	for {
+		connected, err := p.watchIPNOnce(ctx, publish)
+		if ctx.Err() != nil {
+			return
+		}
+		slog.Error("IPN bus watcher stopped", "err", err)
+		p.watchError(err)
+		if connected || !down {
+			// tailscaled is gone or unreachable, so its last status no
+			// longer applies.
+			down = true
+			select {
+			case <-ctx.Done():
+				return
+			case <-p.poll:
+			}
+			if !publish(IPNStatus{State: ipn.NoState}.copy()) {
+				return
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(5 * time.Second):
+		}
+	}
+}
+
+// holdIPN keeps the latest IPN status for GetIPN and resend.
+func (p *Poller) holdIPN(ctx context.Context, set <-chan *IPNStatus) {
+	var get chan *IPNStatus
+	var s *IPNStatus
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case s = <-set:
+			get = p.getIPN
+			p.New(s)
+		case get <- s:
+		case <-p.resend:
+			if s != nil {
+				p.New(s)
+			}
+		}
+	}
+}
+
+// watchIPNOnce follows one IPN bus connection until it fails.
+// connected reports whether the connection was ever made.
+func (p *Poller) watchIPNOnce(ctx context.Context, publish func(*IPNStatus) bool) (connected bool, err error) {
+	const watcherOpts = ipn.NotifyInitialState |
+		ipn.NotifyInitialPrefs |
+		ipn.NotifyWatchEngineUpdates |
+		ipn.NotifyInitialStatus |
+		ipn.NotifyPeerChanges
+
+	watcher, err := localClient.WatchIPNBus(ctx, watcherOpts)
+	if err != nil {
+		return false, err
+	}
+	defer watcher.Close()
+	p.watchError(nil)
+
+	// Read notifications even while publishing is held up, such as
+	// while starting or stopping, so that what's published afterwards
+	// is current.
+	updates := make(chan *IPNStatus)
+	errc := make(chan error, 1)
+	go func() {
+		var s IPNStatus
+		for {
+			notify, err := watcher.Next()
+			if err != nil {
+				// Any error ends the stream; Next would keep failing.
+				errc <- err
+				return
+			}
+
+			if notify.ErrMessage != nil {
+				var state ipn.State
+				if notify.State != nil {
+					state = *notify.State
+				}
+				slog.Error("watcher got error message", "state", state, "err", notify.ErrMessage)
+			}
+
+			dirty, targetsDirty := s.applyNotify(&notify)
+			if targetsDirty {
+				s.refreshFileTargets(ctx)
+			}
+
+			// TODO: Handle health warnings.
+			if !dirty {
+				continue
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case updates <- s.copy():
+			}
+		}
+	}()
+
+	var latest *IPNStatus
+	var poll <-chan struct{}
+	for {
+		select {
+		case <-ctx.Done():
+			return true, ctx.Err()
+		case err := <-errc:
+			return true, err
+		case latest = <-updates:
+			poll = p.poll
+		case <-poll:
+			if !publish(latest) {
+				return true, ctx.Err()
+			}
+			poll = nil
+		}
+	}
+}
+
+func (p *Poller) watchFiles(ctx context.Context, n *notifier) {
+	for {
+		files, err := WaitingFiles(ctx)
+		if err != nil && !errors.Is(err, taildrop.ErrNoTaildrop) {
+			if ctx.Err() != nil {
+				return
+			}
+			slog.Error("get waiting files", "err", err)
+			goto wait
+		}
+
+		p.New(&FileStatus{Files: files})
+
+	wait:
+		select {
+		case <-ctx.Done():
+			return
+		case <-n.notify:
+			n = n.next
+		}
+	}
+}
+
+func (p *Poller) watchProfiles(ctx context.Context, n *notifier) {
+	for {
+		profile, profiles, err := GetProfileStatus(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			slog.Error("get profile status", "err", err)
+			goto wait
+		}
+
+		p.New(&ProfileStatus{Profile: profile, Profiles: profiles})
+
+	wait:
+		select {
+		case <-ctx.Done():
+			return
+		case <-n.notify:
+			n = n.next
+		}
+	}
+}
+
+// Poll returns a channel that, when received from, refreshes waiting
+// files and login profiles. IPN status comes from the watch bus;
+// receiving also unblocks publishing of a pending IPN update.
+func (p *Poller) Poll() <-chan struct{} {
+	p.init()
+
+	return p.poll
+}
+
+// GetIPN returns a channel that yields the most recently fetched
+// network status. It will block until the network status has been
+// fetched successfully once.
+func (p *Poller) GetIPN() <-chan *IPNStatus {
+	p.init()
+
+	return p.getIPN
+}
+
+// NextIPN returns a channel that is sent the new IPNStatus each time
+// it is available if anyone is receiving from it. Unlike [GetIPN],
+// this channel does not yield the previous status, so it is useful if
+// an update is expected to arrive soon. Most usages should use
+// [GetIPN] instead as it significantly faster.
+func (p *Poller) NextIPN() <-chan *IPNStatus {
+	p.init()
+
+	return p.nextIPN
+}
+
+// SetRunning returns a channel that starts Tailscale when sent true
+// and stops it when sent false. The poller doesn't publish IPN updates
+// while it's starting or stopping, and polls as soon as it's done.
+// Errors go to Error. Sending blocks while a previous request is
+// running, so don't send from the main thread.
+func (p *Poller) SetRunning() chan<- bool {
+	p.init()
+
+	return p.running
+}
+
+// SetInterval returns a channel that modifies the polling interval of
+// a running poller. This will delay the next poll until the new
+// interval has elapsed.
+func (p *Poller) SetInterval() chan<- time.Duration {
+	p.init()
+
+	return p.interval
+}
+
+type Status interface {
+	status()
+}
+
+type IPNStatus struct {
+	State       ipn.State
+	Prefs       ipn.PrefsView
+	self        tailcfg.NodeView
+	Peers       map[tailcfg.StableNodeID]tailcfg.NodeView
+	FileTargets set.Set[tailcfg.StableNodeID]
+	Engine      *ipn.EngineStatus
+	BrowseToURL string
+
+	// Domain is the tailnet's MagicDNS suffix, without a trailing dot.
+	Domain string
+
+	// UserProfiles maps user IDs to their profiles. It is only
+	// populated from the initial status sent by tailscaled, and is used
+	// to label peers by owner.
+	UserProfiles map[tailcfg.UserID]tailcfg.UserProfileView
+}
+
+func (*IPNStatus) status() {}
+
+// copy returns a copy of s to publish. Published statuses always have
+// valid Prefs, empty if tailscaled hasn't sent any, so that readers
+// don't have to check.
+func (s IPNStatus) copy() *IPNStatus {
+	if !s.Prefs.Valid() {
+		s.Prefs = new(ipn.Prefs).View()
+	}
+	s.Peers = maps.Clone(s.Peers)
+	s.FileTargets = maps.Clone(s.FileTargets)
+	s.UserProfiles = maps.Clone(s.UserProfiles)
+	return &s
+}
+
+func (s *IPNStatus) ensurePeers() {
+	if s.Peers == nil {
+		s.Peers = make(map[tailcfg.StableNodeID]tailcfg.NodeView)
+	}
+}
+
+// applyNotify applies notify. targetsDirty is true when Taildrop eligibility
+// may have changed: bootstrap, peer add/remove, or self identity change.
+// Online-only upserts do not set it; FileTargets does not depend on Online.
+func (s *IPNStatus) applyNotify(notify *ipn.Notify) (dirty, targetsDirty bool) {
+	if notify.State != nil {
+		s.State = *notify.State
+		dirty = true
+	}
+	if notify.Prefs != nil && notify.Prefs.Valid() {
+		s.Prefs = *notify.Prefs
+		dirty = true
+	}
+	if notify.Engine != nil {
+		s.Engine = notify.Engine
+		dirty = true
+	}
+	if notify.BrowseToURL != nil {
+		s.BrowseToURL = *notify.BrowseToURL
+		dirty = true
+	}
+
+	if notify.InitialStatus != nil {
+		s.applyInitialStatus(notify.InitialStatus)
+		dirty = true
+		targetsDirty = true
+	}
+	if notify.SelfChange != nil {
+		dirty = true
+		targetsDirty = s.applySelfChange(notify.SelfChange) || targetsDirty
+	}
+	if len(notify.PeersChanged) != 0 {
+		dirty = true
+		targetsDirty = s.applyPeersChanged(notify.PeersChanged) || targetsDirty
+	}
+	if len(notify.PeersRemoved) != 0 {
+		dirty = true
+		targetsDirty = s.applyPeersRemoved(notify.PeersRemoved) || targetsDirty
+	}
+	return dirty, targetsDirty
+}
+
+func (s *IPNStatus) applyInitialStatus(st *ipnstate.Status) {
+	var suffix string
+	if st.CurrentTailnet != nil {
+		suffix = st.CurrentTailnet.MagicDNSSuffix
+	}
+	if suffix == "" {
+		suffix = st.MagicDNSSuffix
+	}
+	s.Domain = suffix
+
+	if len(st.User) != 0 {
+		s.UserProfiles = make(map[tailcfg.UserID]tailcfg.UserProfileView, len(st.User))
+		for id, profile := range st.User {
+			s.UserProfiles[id] = profile.View()
+		}
+	}
+
+	if st.Self != nil {
+		s.self = nodeViewFromPeerStatus(st.Self, suffix)
+	}
+
+	s.ensurePeers()
+	clear(s.Peers)
+	for _, peer := range st.Peer {
+		if peer == nil {
+			continue
+		}
+		s.Peers[peer.ID] = nodeViewFromPeerStatus(peer, suffix)
+	}
+}
+
+func (s *IPNStatus) applySelfChange(self *tailcfg.Node) (identityChanged bool) {
+	nv := self.View()
+	if s.self.Valid() && nv.Valid() && !sameSelfNode(s.self, nv) {
+		// Profile switches reuse the watch session and send a complete
+		// PeersChanged list without PeersRemoved for the old nodes.
+		clear(s.Peers)
+		clear(s.FileTargets)
+		identityChanged = true
+	}
+	s.self = nv
+	return identityChanged
+}
+
+func sameSelfNode(a, b tailcfg.NodeView) bool {
+	return a.ID() == b.ID() && a.StableID() == b.StableID() && a.User() == b.User()
+}
+
+func (s *IPNStatus) applyPeersChanged(peers []*tailcfg.Node) (added bool) {
+	s.ensurePeers()
+	for _, peer := range peers {
+		if _, ok := s.Peers[peer.StableID]; !ok {
+			added = true
+		}
+		s.Peers[peer.StableID] = peer.View()
+	}
+	return added
+}
+
+func (s *IPNStatus) applyPeersRemoved(ids []tailcfg.NodeID) (removed bool) {
+	for _, id := range ids {
+		for stableID, peer := range s.Peers {
+			if peer.ID() == id {
+				delete(s.Peers, stableID)
+				removed = true
+				break
+			}
+		}
+	}
+	return removed
+}
+
+func (s *IPNStatus) refreshFileTargets(ctx context.Context) {
+	// This is a lot longer than it probably should be. It's basically
+	// just to make sure that the poller doesn't get completely stuck. If
+	// this is getting hit, though, the UI is going to be updating
+	// horribly slow.
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	targets, err := FileTargets(ctx)
+	if err != nil {
+		slog.Error("failed to get file targets", "err", err)
+		return
+	}
+	s.FileTargets.Make()
+	clear(s.FileTargets)
+	for _, target := range targets {
+		s.FileTargets.Add(target.Node.StableID)
+	}
+}
+
+// nodeViewFromPeerStatus builds a NodeView from an ipnstate.PeerStatus for
+// the InitialStatus bootstrap. Subsequent updates use full Nodes from
+// SelfChange / PeersChanged.
+func nodeViewFromPeerStatus(ps *ipnstate.PeerStatus, magicDNSSuffix string) tailcfg.NodeView {
+	if ps == nil {
+		return tailcfg.NodeView{}
+	}
+
+	online := ps.Online
+	n := &tailcfg.Node{
+		ID:       ps.NodeID,
+		StableID: ps.ID,
+		Name:     ps.DNSName,
+		User:     ps.UserID,
+		Sharer:   ps.AltSharerUserID,
+		Key:      ps.PublicKey,
+		Created:  ps.Created,
+		Online:   &online,
+		Expired:  ps.Expired,
+		CapMap:   maps.Clone(ps.CapMap),
+	}
+	if ps.KeyExpiry != nil {
+		n.KeyExpiry = *ps.KeyExpiry
+	}
+	if !ps.LastSeen.IsZero() {
+		lastSeen := ps.LastSeen
+		n.LastSeen = &lastSeen
+	}
+	for _, ip := range ps.TailscaleIPs {
+		n.Addresses = append(n.Addresses, netip.PrefixFrom(ip, ip.BitLen()))
+	}
+	if ps.AllowedIPs != nil {
+		n.AllowedIPs = ps.AllowedIPs.AsSlice()
+	}
+	if ps.Tags != nil {
+		n.Tags = ps.Tags.AsSlice()
+	}
+	if ps.PrimaryRoutes != nil {
+		n.PrimaryRoutes = ps.PrimaryRoutes.AsSlice()
+	}
+
+	hi := &tailcfg.Hostinfo{
+		Hostname:   ps.HostName,
+		OS:         ps.OS,
+		ShareeNode: ps.ShareeNode,
+	}
+	if ps.Location != nil {
+		loc := *ps.Location
+		hi.Location = &loc
+	}
+	n.Hostinfo = hi.View()
+	n.InitDisplayNames(magicDNSSuffix)
+	return n.View()
+}
+
+// Online returns true if s indicates that the local node is online
+// and connected to the tailnet.
+func (s *IPNStatus) Online() bool {
+	return s.State == ipn.Running
+}
+
+func (s *IPNStatus) NeedsAuth() bool {
+	return s.State == ipn.NeedsLogin
+}
+
+func (s *IPNStatus) ExitNodeActive() bool {
+	return s.Prefs.ExitNodeID() != "" || s.Prefs.ExitNodeIP().IsValid()
+}
+
+func (s *IPNStatus) ExitNode() tailcfg.NodeView {
+	if node, ok := s.Peers[s.Prefs.ExitNodeID()]; ok {
+		return node
+	}
+	if addr := s.Prefs.ExitNodeIP(); addr.IsValid() {
+		return s.peerByTailscaleIP(addr)
+	}
+	return tailcfg.NodeView{}
+}
+
+func (s *IPNStatus) peerByTailscaleIP(ip netip.Addr) tailcfg.NodeView {
+	for _, peer := range s.Peers {
+		for _, a := range peer.Addresses().All() {
+			if a.Addr() == ip {
+				return peer
+			}
+		}
+	}
+	return tailcfg.NodeView{}
+}
+
+func (s *IPNStatus) OperatorIsCurrent() bool {
+	current, err := user.Current()
+	if err != nil {
+		slog.Error("get current user", "err", err)
+		return false
+	}
+
+	return s.Prefs.OperatorUser() == current.Username
+}
+
+// Self returns the local node. The boolean is false when the node is
+// missing or invalid.
+func (s *IPNStatus) Self() (tailcfg.NodeView, bool) {
+	n := s.self
+	return n, n.Valid()
+}
+
+func (s *IPNStatus) SelfAddr() netip.Addr {
+	self, ok := s.Self()
+	if !ok {
+		return netip.Addr{}
+	}
+
+	addrs := self.Addresses()
+	if addrs.Len() == 0 {
+		return netip.Addr{}
+	}
+
+	addr := addrs.At(0)
+	for _, a := range addrs.SliceFrom(1).All() {
+		if a.Compare(addr) < 0 {
+			addr = a
+		}
+	}
+	return addr.Addr()
+}
+
+type FileStatus struct {
+	Files []apitype.WaitingFile
+}
+
+func (*FileStatus) status() {}
+
+type ProfileStatus struct {
+	Profile  ipn.LoginProfile
+	Profiles []ipn.LoginProfile
+}
+
+func (*ProfileStatus) status() {}
+
+type notifier struct {
+	notify chan struct{}
+	next   *notifier
+}
+
+func newNotifier() *notifier {
+	return &notifier{
+		notify: make(chan struct{}),
+	}
+}
+
+func (n *notifier) Notify() *notifier {
+	n.next = newNotifier()
+	close(n.notify)
+	return n.next
+}
